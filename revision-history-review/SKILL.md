@@ -1,6 +1,6 @@
 ---
 name: revision-history-review
-description: Review controlled documents (SOPs, WIs, forms, specifications, protocols, reports; .docx or .pdf) for revision consistency before approval. Checks (1) the file name matches the page header (doc #, Rev, title), (2) the latest Rev in the revision history table matches the header/file-name Rev, (3) the changes described in the revision history table are actually present in the document content, (4) reports "no Rev. history Table of <file>" when the table is missing, (5) outputs a File / Discrepancy table, and (6) when an old revision is also attached, diffs old vs new and confirms the revision history entry matches the real changes (nothing undocumented, nothing claimed but not made). Trigger on "review revision history", "rev history", "check revision", "doc review", "compare old and new version", "redline check", or when one or more controlled documents are uploaded for review.
+description: Review controlled documents (SOPs, WIs, forms, specifications, protocols, reports, forms/logs; .docx, .pdf or .xlsx, and old and new versions may be in different formats) for revision consistency before approval. Checks (1) the file name matches the page header (doc #, Rev, title), (2) the latest Rev in the revision history table matches the header/file-name Rev, (3) the changes described in the revision history table are actually present in the document content, (4) reports "no Rev. history Table of <file>" when the table is missing, (5) outputs a File / Discrepancy table, and (6) when an old revision is also attached, diffs old vs new and confirms the revision history entry matches the real changes (nothing undocumented, nothing claimed but not made). Trigger on "review revision history", "rev history", "check revision", "doc review", "compare old and new version", "redline check", or when one or more controlled documents are uploaded for review.
 ---
 
 # Revision History Review
@@ -22,7 +22,13 @@ cite what was found (quote the text, give the section).
   `SOP-0012 ... Rev 2.docx` and `SOP-0012 ... Rev 3.docx`). Within a group, the
   file with the **higher Rev in its file name/header** is the new version and the
   others are old versions (function 6). Files with no partner are reviewed alone.
-- `.doc` files: convert first: `soffice --headless --convert-to docx <file>`.
+- Supported directly: `.docx`, `.pdf` (text PDFs), `.xlsx`/`.xlsm`, `.txt`/`.md`.
+  Old and new versions **do not need to be the same format** (e.g. the old
+  revision is the released PDF and the new one is the Word draft).
+- `.doc` / `.xls` files: convert first:
+  `soffice --headless --convert-to docx <file>` (or `--convert-to xlsx`).
+- Scanned PDFs (no selectable text): the script finds no text. Read the pages
+  with the Read tool / pdf skill and apply the checks by hand.
 - Screenshots / images: read them directly and apply the same checks by hand.
 
 ### Step 2 – Extract (every file)
@@ -41,6 +47,17 @@ It writes `<scratch_dir>/<file stem>.json` with:
 - `latest_rev_in_table`, `latest_change_description`
 - `auto_checks` – results with ids 1a–1d, 2a–2e, 3a, 4 (see below)
 - `body` – headings, paragraphs and tables in order, used for the content check
+
+How each format is read:
+- **Word**: page headers of every section, body paragraphs and tables in order.
+- **PDF**: the top band of each page is taken as the header. Ruled tables are read
+  as tables. For a borderless revision history table, the entries are read line by
+  line under the "Revision History" heading (`parsed_from: "text lines"`). Glance
+  at the page to confirm wrapped descriptions were joined correctly.
+- **Excel**: each sheet is treated as a section (`[Sheet] <name>`). The header comes
+  from the print header (Page Layout → Header). If there is none, the title rows at
+  the top of the first sheet are used. A "Revision History" sheet, or a
+  revision table on any sheet, is detected the same way as in Word.
 
 Treat `auto_checks` as a first pass, not the verdict: confirm each FAIL by looking at
 the extracted text (a parsing miss is not a document error), and resolve every
@@ -91,7 +108,15 @@ For each old/new pair:
 python3 <skill_dir>/scripts/compare_versions.py <old_file> <new_file> --out <scratch_dir>
 ```
 
-This writes `diff_<old>__<new>.md` / `.json`: old vs new Revs, the revision history
+Any combination of formats works (PDF → DOCX, XLSX → XLSX, PDF → PDF ...).
+Same-format pairs are compared paragraph by paragraph / table row by table row
+(`mode: structured`). Different-format pairs are compared sentence by sentence
+within each section (`mode: text`), so PDF line wraps and page breaks are not
+reported as changes. In text mode, table layout changes (added/removed columns,
+merged cells) can be missed, so open the tables in both versions and compare them
+by eye.
+
+It writes `diff_<old>__<new>.md` / `.json`: old vs new Revs, the revision history
 rows added since the old version, and every body change by section with word-level
 markup (`[-removed-]` `{+added+}`). The revision history table itself is excluded
 from the body diff. Then:
@@ -136,6 +161,10 @@ Save the output to a markdown file if the user wants a record (see
 
 ## Notes
 
+- Excel forms: a change to a column heading, an acceptance limit or a formula
+  result in a cell is a content change and must be in the revision history. Cell
+  formatting/colour changes are not detected; mention them only if the user
+  points them out.
 - Rev formats: numeric (`1`, `01`, `2.1`) and letter (`A`, `B`, `AA`) revs are
   both understood. `01` and `1` count as the same Rev. A document whose header uses
   letters while the table uses numbers is a discrepancy.

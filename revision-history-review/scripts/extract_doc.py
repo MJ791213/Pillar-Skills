@@ -5,7 +5,8 @@ controlled documents, and run the mechanical revision checks.
 Usage:
     python3 extract_doc.py <file> [<file> ...] --out <dir>
 
-Supports .docx (python-docx) and .pdf (pdfplumber, falls back to pdftotext).
+Supports .docx (python-docx), .pdf (pdfplumber, falls back to pdftotext),
+.xlsx/.xlsm (openpyxl; each sheet is treated as a section) and .txt/.md.
 For each input writes <dir>/<stem>.json and prints a one-line summary of
 each automated check. Content checks (does the body reflect what the revision
 history says changed?) need reading and judgment, so they are left to the
@@ -25,7 +26,10 @@ REV_TABLE_KEYWORDS = ("revision history", "rev. history", "rev history", "docume
                       "change history", "revision record", "history of changes")
 DESC_HEADER_RE = re.compile(r"(description|change|summary|reason|update|detail)", re.I)
 DATE_HEADER_RE = re.compile(r"(date|effective)", re.I)
-SECTION_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(\S.*)$")
+SECTION_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+([A-Z][^;,]*)$")
+DATE_RE = re.compile(r"\b(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|"
+                     r"\d{1,2}[- ]?[A-Za-z]{3}[- ]?\d{2,4}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4})\b")
+REV_TOKEN_RE = re.compile(r"^(?:Rev(?:ision)?\.?\s*)?(\d{1,3}(?:\.\d+)?|[A-Z]{1,2}\d?)\b\s*(.*)$")
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +148,37 @@ def build_rev_history(rows, hi, cols):
 # --------------------------------------------------------------------------
 # DOCX
 # --------------------------------------------------------------------------
+def parse_rev_lines(lines):
+    """Fallback for PDFs/text where the table grid cannot be detected: read the
+    lines after the "Revision History" heading. A line starting with a Rev token
+    starts an entry; other lines continue the previous description. If most
+    entry lines carry a date, a date is required (so a wrapped "3 on training"
+    is not taken as Rev 3)."""
+    start = next((i for i, l in enumerate(lines) if REV_HEADER_RE.match(l.split()[0] if l.split() else "")
+                  or re.match(r"^\s*(rev(ision)?\.?|version)\b.*\b(description|change|date)", l, re.I)), None)
+    if start is None:
+        return []
+    cands = []
+    for l in lines[start + 1:]:
+        m = REV_TOKEN_RE.match(l)
+        cands.append((l, m))
+    dated = sum(1 for l, m in cands if m and DATE_RE.search(l))
+    need_date = dated >= max(1, sum(1 for _, m in cands if m) // 2)
+    entries = []
+    for l, m in cands:
+        if m and (not need_date or DATE_RE.search(l)) and not (entries and need_date and not DATE_RE.search(l)):
+            rest = m.group(2)
+            dm = DATE_RE.search(rest)
+            date = dm.group(0) if dm else None
+            desc = norm(rest.replace(date, "", 1)) if date else rest
+            entries.append({"rev": canon_rev(m.group(1)), "date": date, "description": desc,
+                            "row": [l], "parsed_from": "text lines"})
+        elif entries:
+            entries[-1]["description"] = norm(entries[-1]["description"] + " " + l)
+            entries[-1]["row"].append(l)
+    return entries
+
+
 def extract_docx(path):
     try:
         import docx
@@ -276,6 +311,77 @@ def extract_pdf(path):
     return headers, body, tables, ctx, {}
 
 
+def extract_xlsx(path):
+    """Excel: print header/footer per sheet, each sheet's used range as a table.
+    Sheets are treated like sections, so a "Revision History" sheet is found by name."""
+    try:
+        import openpyxl
+    except ImportError:
+        sys.exit("openpyxl is required: pip install openpyxl")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    headers, body, tables, ctx, top_rows = [], [], [], [], []
+
+    def cell_text(v):
+        if v is None:
+            return ""
+        if hasattr(v, "strftime"):
+            return v.strftime("%Y-%m-%d")
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    for ws in wb.worksheets:
+        hf = []
+        for part_name in ("oddHeader", "firstHeader", "evenHeader"):
+            part = getattr(ws, part_name, None)
+            if part is None:
+                continue
+            for pos in ("left", "center", "right"):
+                t = getattr(getattr(part, pos, None), "text", None)
+                if t:
+                    # strip Excel header codes such as &P, &N, &"Arial,Bold", &12
+                    t = re.sub(r'&"[^"]*"|&\d+|&[A-Za-z]', " ", t)
+                    hf.append(norm(t.replace("&&", "&")))
+        if hf:
+            headers.append({"section": ws.title, "type": "print header", "text": "  ".join(hf)})
+
+        rows = []
+        for r in ws.iter_rows(values_only=True):
+            cells = [cell_text(v) for v in r]
+            while cells and not cells[-1].strip():
+                cells.pop()
+            if any(c.strip() for c in cells):
+                rows.append(cells)
+        width = max((len(r) for r in rows), default=0)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        heading = f"[Sheet] {ws.title}"
+        body.append({"type": "heading", "text": heading})
+        if rows:
+            top_rows.append((ws.title, rows))
+        if rows:
+            tables.append(rows)
+            ctx.append(heading)
+            body.append({"type": "table", "index": len(tables) - 1, "under": heading,
+                         "rows": [[norm(c) for c in r] for r in rows]})
+    if not headers:
+        # no print header anywhere: the title block is usually in the first rows of
+        # the first (non revision-history) sheet; take the leading single-text rows
+        for title, rows in top_rows:
+            if any(k in title.lower() for k in REV_TABLE_KEYWORDS) or "history" in title.lower():
+                continue
+            top = []
+            for r in rows[:4]:
+                filled = [c for c in r if c.strip()]
+                if len(filled) > 2:
+                    break  # reached the form's column headings
+                top.append(" ".join(filled))
+            if top:
+                headers.append({"section": title, "type": "top rows (no print header)", "text": "\n".join(top)})
+            break
+    meta = {"title": wb.properties.title, "subject": wb.properties.subject}
+    return headers, body, tables, ctx, meta
+
+
 def extract_text(path):
     lines = [norm(l) for l in Path(path).read_text(errors="replace").splitlines()]
     headers = [{"section": 0, "type": "first lines", "text": "\n".join(l for l in lines[:3] if l)}]
@@ -369,10 +475,13 @@ def extract(path):
         headers, body, tables, ctx, meta = extract_docx(path)
     elif ext == ".pdf":
         headers, body, tables, ctx, meta = extract_pdf(path)
+    elif ext in (".xlsx", ".xlsm"):
+        headers, body, tables, ctx, meta = extract_xlsx(path)
     elif ext in (".txt", ".md"):
         headers, body, tables, ctx, meta = extract_text(path)
     else:
-        sys.exit(f"Unsupported file type: {path.name} (convert .doc to .docx first)")
+        sys.exit(f"Unsupported file type: {path.name} "
+                 "(convert .doc/.xls first: soffice --headless --convert-to docx|xlsx <file>)")
 
     fn = parse_filename(path)
     hdr = parse_header("\n".join(h["text"] for h in headers))
@@ -390,9 +499,13 @@ def extract(path):
         idx = next((i for i, b in enumerate(body) if b["type"] != "table"
                     and any(k in b["text"].lower() for k in REV_TABLE_KEYWORDS)), None)
         if idx is not None:
-            rev_table = {"table_index": None, "under_heading": body[idx]["text"],
-                         "note": "Heading found but no parsable table; read the section manually.",
-                         "following_text": [b.get("text") for b in body[idx + 1: idx + 25]]}
+            following = [b["text"] for b in body[idx + 1: idx + 60] if b["type"] != "table"]
+            rev_hist = parse_rev_lines(following)
+            rev_table = {"table_index": "text-lines" if rev_hist else None,
+                         "under_heading": body[idx]["text"],
+                         "note": ("Table grid not detected; entries read line by line. Verify against the page."
+                                  if rev_hist else "Heading found but no parsable table; read the section manually."),
+                         "following_text": following[:25]}
 
     latest = max((e["rev"] for e in rev_hist), key=rev_key) if rev_hist else None
     return {
